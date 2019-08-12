@@ -4,10 +4,12 @@
  */
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <msi.h>
 #include <msidefs.h>
 #include <msiquery.h>
 #include <shlwapi.h>
+#include <shlobj.h>
 #include <stdbool.h>
 #include <tchar.h>
 
@@ -269,6 +271,96 @@ __declspec(dllexport) UINT __stdcall RemoveConfigFolder(MSIHANDLE installer)
 		goto out;
 	}
 	remove_directory_recursive(installer, path, 10);
+out:
+	if (is_com_initialized)
+		CoUninitialize();
+	return ERROR_SUCCESS;
+}
+
+struct file_id { DWORD volume, index_high, index_low; };
+
+static bool calculate_file_id(const TCHAR *path, struct file_id *id)
+{
+	BY_HANDLE_FILE_INFORMATION file_info = { 0 };
+	HANDLE file;
+	bool ret;
+
+	file = CreateFile(path, 0, 0, NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+	if (file == INVALID_HANDLE_VALUE)
+		return false;
+	ret = GetFileInformationByHandle(file, &file_info);
+	CloseHandle(file);
+	if (!ret)
+		return false;
+	id->volume = file_info.dwVolumeSerialNumber;
+	id->index_high = file_info.nFileIndexHigh;
+	id->index_low = file_info.nFileIndexLow;
+	return true;
+}
+
+__declspec(dllexport) UINT __stdcall KillWireGuardProcesses(MSIHANDLE installer)
+{
+	HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPALL, 0), process;
+	PROCESSENTRY32 entry = { .dwSize = sizeof(PROCESSENTRY32) };
+	TCHAR process_path[MAX_PATH + 1], *folder_path;
+	DWORD process_path_len;
+	struct file_id file_ids[3], file_id;
+	size_t file_ids_len = 0;
+	bool is_com_initialized = SUCCEEDED(CoInitialize(NULL));
+
+	if (SHGetKnownFolderPath(&FOLDERID_ProgramFiles, KF_FLAG_DEFAULT, NULL, &folder_path) == S_OK) {
+		if (PathCombine(process_path, folder_path, TEXT("WireGuard\\wireguard.exe"))) {
+			if (calculate_file_id(process_path, &file_ids[file_ids_len]))
+				++file_ids_len;
+		}
+		CoTaskMemFree(folder_path);
+	}
+	if (SHGetKnownFolderPath(&FOLDERID_System, KF_FLAG_DEFAULT, NULL, &folder_path) == S_OK) {
+		if (PathCombine(process_path, folder_path, TEXT("wg.exe"))) {
+			if (calculate_file_id(process_path, &file_ids[file_ids_len]))
+				++file_ids_len;
+		}
+		CoTaskMemFree(folder_path);
+	}
+	if (SHGetKnownFolderPath(&FOLDERID_SystemX86, KF_FLAG_DEFAULT, NULL, &folder_path) == S_OK) {
+		if (PathCombine(process_path, folder_path, TEXT("wg.exe"))) {
+			if (calculate_file_id(process_path, &file_ids[file_ids_len]))
+				++file_ids_len;
+		}
+		CoTaskMemFree(folder_path);
+	}
+
+	if (!file_ids_len)
+		goto out;
+
+	for (bool ret = Process32First(snapshot, &entry); ret; ret = Process32Next(snapshot, &entry)) {
+		if (_tcsicmp(entry.szExeFile, TEXT("wireguard.exe")) && _tcsicmp(entry.szExeFile, TEXT("wg.exe")))
+			continue;
+		process = OpenProcess(PROCESS_TERMINATE | PROCESS_QUERY_LIMITED_INFORMATION, false, entry.th32ProcessID);
+		if (!process)
+			continue;
+		process_path_len = _countof(process_path);
+		if (!QueryFullProcessImageName(process, 0, process_path, &process_path_len))
+			goto next;
+		if (!calculate_file_id(process_path, &file_id))
+			goto next;
+		ret = false;
+		for (size_t i = 0; i < file_ids_len; ++i) {
+			if (!memcmp(&file_id, &file_ids[i], sizeof(file_id))) {
+				ret = true;
+				break;
+			}
+		}
+		if (!ret)
+			goto next;
+		log_messagef(installer, LOG_LEVEL_INFO, TEXT("Killing %1 (pid %2!d!)"), process_path, entry.th32ProcessID);
+		if (TerminateProcess(process, 0))
+			WaitForSingleObject(process, INFINITE);
+	next:
+		CloseHandle(process);
+	}
+	CloseHandle(snapshot);
+
 out:
 	if (is_com_initialized)
 		CoUninitialize();
